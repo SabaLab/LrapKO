@@ -1,0 +1,518 @@
+---
+title: "Differential Expression of Brain RNA Levels in Lrap Knockout Male Rats and Their Wild Type Controls"
+author: "Laura Saba"
+date: "August 18, 2020"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_collapsed: false
+    fig_caption: yes
+    fig_retina: 1 
+    code_folding: hide
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+rm(list=ls())
+options(stringsAsFactors=FALSE)
+
+library(dplyr)
+library(kableExtra)
+library(DESeq2) 
+
+
+bf = "/Volumes/sabal/lncRNA.KO/RNA-Seq/"
+github = "~/Documents/GitHub/LrapKO/"
+
+##  Global Functions  ##
+trim <- function (x) gsub("^\\s+|\\s+$", "", x)               # remove leading and trailing spaces
+fdr_format <- function(x,digits){
+  y = sprintf(paste("%.",digits,"f",sep=""),round(x,digits))
+  min_y = 10^(-1*(digits))
+  y[x<min_y] = paste("<0.",paste(rep(0,digits-1),collapse=""),1,sep="")
+  return(y)
+}
+```
+
+
+## 1.  Count raw reads
+```
+./countRawReads.lrapKO.sh &
+```
+
+```{r raw_cnts, echo=FALSE}
+raw_cnts <- read.table(file=paste0(github,"data/rawReadCounts.txt"), sep=" ", header=FALSE)
+raw_cnts$file_name = unlist(lapply(strsplit(raw_cnts$V1,split="/", fixed=TRUE), function(a) a[length(a)]))
+raw_cnts$genotype = unlist(lapply(strsplit(raw_cnts$file_name,split="-", fixed=TRUE), function(a) a[3]))
+raw_cnts$bio_rep = unlist(lapply(strsplit(raw_cnts$file_name,split="-", fixed=TRUE), function(a) a[4]))
+raw_cnts$sample = paste(raw_cnts$genotype, raw_cnts$bio_rep, sep="-")
+
+raw_cnts$read_frags = prettyNum(raw_cnts$V3*2, big.mark = ",")
+raw_cnts$read_pairs = prettyNum(raw_cnts$V3, big.mark = ",")
+raw_cnts$read_length = raw_cnts$V2
+
+pretty_raw = raw_cnts[!duplicated(raw_cnts$sample),c("sample","read_frags","read_pairs","read_length")]
+colnames(pretty_raw) = c("Sample","Number of Read Fragments","Number of Read Pairs","Read Length")
+```
+
+Number of RNA-Seq samples: `r nrow(pretty_raw)`
+
+Average Number of Read Pairs Per Sample: `r prettyNum(round(mean(raw_cnts$V3)),big.mark=",")`
+
+**Table 1. Number of raw reads per library.** Each library represents a different biological samples. Libraries were generated from total RNA (>200nt) where ribosomal RNA has been depleted.
+
+```{r table_1, results='asis',echo=FALSE,eval=TRUE}
+kable(as.data.frame(pretty_raw), "html",align=rep("c",ncol(pretty_raw)),row.names=FALSE) %>%
+  kable_styling(bootstrap_options = "striped", full_width = F, position="left")
+```
+
+
+## 2.  Trim reads
+
+Trim reads for adaptors and poor quality base calls
+```
+./trimReads.lrapKO.sh &
+```
+
+Count number of reads and average read length after trimming
+```
+./countTrimmedReads.lrapKO.sh &
+```
+
+```{r trimmed_cnts, eval=TRUE}
+trim_cnts <- read.table(file=paste0(github,"data/trimmedReadCounts.txt"), sep=" ", header=FALSE)
+trim_cnts$file_name = unlist(lapply(strsplit(trim_cnts$V1,split="/", fixed=TRUE), function(a) a[length(a)]))
+trim_cnts$genotype = unlist(lapply(strsplit(trim_cnts$file_name,split="-", fixed=TRUE), function(a) a[3]))
+trim_cnts$bio_rep = unlist(lapply(strsplit(trim_cnts$file_name,split="-", fixed=TRUE), function(a) a[4]))
+trim_cnts$sample = paste(trim_cnts$genotype, trim_cnts$bio_rep, sep="-")
+
+trim_cnts$trim_frags = prettyNum(trim_cnts$V3*2, big.mark = ",")
+trim_cnts$trim_pairs = prettyNum(trim_cnts$V3, big.mark = ",")
+trim_cnts$trim_length = sprintf("%.1f",round(trim_cnts$V2,1))
+
+combo1 = merge(raw_cnts[!duplicated(raw_cnts$sample),],trim_cnts[!duplicated(trim_cnts$sample),], by="sample")
+combo1$pct_trimmed = (combo1$V3.x - combo1$V3.y) / combo1$V3.x
+combo1$pct_trimmed = paste0(sprintf("%.2f", round(combo1$pct_trimmed*100,2)),"%")
+ 
+pretty_trimmed = combo1[,c("sample","read_frags","trim_frags","trim_length","pct_trimmed")] 
+colnames(pretty_trimmed) = c("Sample","Original Number of Read Fragments","Number of Read Fragments After Trimming","Average Trimmed Read Length","Percent of Reads Removed During Trimming")
+```
+
+Average number of read pairs per sample after trimming: `r prettyNum(mean(trim_cnts$V3), big.mark=",")`
+
+Average read fragement length after trimming: `r round(mean(trim_cnts$V2),1)`
+
+**Table 2. Results from trimming reads for adaptors and for quality.** 
+
+```{r table_2, results='asis',echo=FALSE,eval=TRUE}
+kable(as.data.frame(pretty_trimmed), "html",align=rep("c",ncol(pretty_trimmed)),row.names=FALSE) %>%
+  kable_styling(bootstrap_options = "striped", full_width = F, position="left")
+```
+
+
+## 3. Align to genome
+
+Align to rat rn6 genome using HISAT2
+```
+./alignToGenome.KO.sh &
+./alignToGenome.Het.sh &
+./alignToGenome.WT.sh &
+```
+
+Sort and merge aligned reads in preparation for transcriptome reconstruction
+
+```
+./sortAlignedReads.KO.sh
+./sortAlignedReads.Het.sh
+./sortAlignedReads.WT.sh
+```
+
+Summary of percent of reads aligned to the genome
+```{r, eval=TRUE}
+samples = c("WT1","WT2","WT3","HET1","HET2","HET3","KO1","KO2","KO3")
+for (i in samples){
+  x <- read.table(file=paste0(bf,"data/alignNotes_",i,".txt"),sep="\t")
+  y <- x[grep(") aligned 0 times",x$V1),]
+  y2 <- x$V1[1]
+  z <- data.frame(sample = i, 
+                trimmed = 2*as.numeric(strsplit(trim(y2),split=" ",fixed=TRUE)[[1]][1]),
+                unmapped = as.numeric(strsplit(trim(y),split=" ",fixed=TRUE)[[1]][1]))
+  if(i==samples[1]) genome_align = z
+  if(i!=samples[1]) genome_align = rbind(genome_align,z)
+}
+
+genome_align$pct_aligned = (genome_align$trimmed - genome_align$unmapped) / genome_align$trimmed
+genome_align$pct_aligned = paste0(sprintf("%.1f", round(genome_align$pct_aligned*100,1)),"%")
+ 
+pretty_gAlign = genome_align[,c("sample","trimmed","unmapped","pct_aligned")] 
+pretty_gAlign$trimmed = prettyNum(pretty_gAlign$trimmed,big.mark=",")
+pretty_gAlign$unmapped = prettyNum(pretty_gAlign$unmapped,big.mark=",")
+
+colnames(pretty_gAlign) = c("Sample","Number of Read Fragments After Trimming","Number of Reads That Did Not Align to the Genome","Percent of Reads Aligned to Genome")
+```
+
+Average rate of alignment: `r paste0(sprintf("%.1f", round(100*mean((genome_align$trimmed - genome_align$unmapped) / genome_align$trimmed),1)),"%")`
+
+**Table 3. Results from alignment to the genome.** 
+
+```{r table_3, results='asis',echo=FALSE,eval=TRUE}
+kable(as.data.frame(pretty_gAlign), "html",align=rep("c",ncol(pretty_gAlign)),row.names=FALSE) %>%
+  kable_styling(bootstrap_options = "striped", full_width = F, position="left")
+```
+
+## 4. Transcriptome reconstruction
+
+Transcriptome reconstruction by genotype using StringTie 
+
+```
+stringtie /data/hi-seq/LRAP.KO/alignedReads/HISAT2/HET.naive.bam -p	8 -o /data/home/sabal/lncRNA.KO/RNA-Seq/reconstruction_v2/lncKO_Het_Recon.gtf -G /data/home/sabal/gtfFiles/ensembl.Rnor_6.0.85.wLRAP.gtf &
+stringtie /data/hi-seq/LRAP.KO/alignedReads/HISAT2/WT.naive.bam -p	8 -o /data/home/sabal/lncRNA.KO/RNA-Seq/reconstruction_v2/lncKO_WT_Recon.gtf -G /data/home/sabal/gtfFiles/ensembl.Rnor_6.0.85.wLRAP.gtf &
+stringtie /data/hi-seq/LRAP.KO/alignedReads/HISAT2/KO.naive.bam -p	8 -o /data/home/sabal/lncRNA.KO/RNA-Seq/reconstruction_v2/lncKO_KO_Recon.gtf -G /data/home/sabal/gtfFiles/ensembl.Rnor_6.0.85.wLRAP.gtf &
+```
+
+Merge genotype transcriptomes
+
+```
+stringtie --merge -m 50 -f 0.001 -c 0 -F 0 -T 0 -p 8 -o lncKO_merged_Recon_v2.gtf lncKO_WT_Recon.gtf lncKO_Het_Recon.gtf  lncKO_KO_Recon.gtf  
+```
+
+Compare reconstructed transcriptome with Ensembl transcriptome
+
+```
+gffcompare -r ensembl.Rnor_6.0.85.wLRAP.gtf -G -o lncKO_merged_wEnsembl lncKO_merged_Recon_v2.gtf
+```
+
+## 5. Quantitate the reconstructed transcriptome
+
+Prepare RSEM reference transcriptome from StringTie GTF
+```
+rsem-prepare-reference --gtf /data/home/sabal/lncRNA.KO/RNA-Seq/reconstruction_v2/lncKO_merged_Recon_v2.gtf --bowtie2 /data/rn6/index/BNLx.rn6.spikes.fa /data/home/sabal/lncRNA.KO/RNA-Seq/reconstruction_v2/lncKO_merged_Recon.hisat &
+```
+
+Estimate read counts of individual biological replicates using RSEM (i.e., alignment directly to the transcriptome)
+
+```
+./RSEMquant.koRecon_v2.sh
+```
+
+Summarize transcriptome alignment rates
+
+```{r, eval=TRUE}
+samples = c("WT1","WT2","WT3","Het1","Het2","Het3","KO1","KO2","KO3")
+
+for(i in samples){
+  x <- read.table(file=paste0(bf,"quantitation/RSEM.koRecon_v2/",i,".naive.stat/",i,".naive.cnt"),sep=" ",nrows=1)
+  y <- data.frame(sample=i,num_trimmed = x$V4, num_aligned = x$V2)
+  if(i==samples[1]) aligned = y
+  if(i!=samples[1]) aligned = rbind(aligned,y)
+}
+
+aligned$pct_aligned = aligned$num_aligned/aligned$num_trimmed
+
+pretty_aligned = aligned
+pretty_aligned$pct_aligned = paste0(sprintf("%.1f",round(pretty_aligned$pct_aligned*100,1)),"%")
+pretty_aligned$num_trimmed = prettyNum(pretty_aligned$num_trimmed, big.mark=",")
+pretty_aligned$num_aligned = prettyNum(pretty_aligned$num_aligned, big.mark=",")
+
+colnames(pretty_aligned) <- c("Sample","Number of Read Fragments After Trimming","Number of Read Fragments Aligned to the Reconstructed Transcriptome","Percent of Read Fragments Aligned to Transcriptome")
+```
+
+**Table 4. Results from alignment to the reconstructed transcriptome.** 
+
+```{r table_4, results='asis',echo=FALSE,eval=TRUE}
+kable(as.data.frame(pretty_aligned), "html",align=rep("c",ncol(pretty_aligned)),row.names=FALSE) %>%
+  kable_styling(bootstrap_options = "striped", full_width = F, position="left")
+```
+
+
+## 6. Differential Expression
+
+### Identify sums of isoforms (SOI) and isoforms that are linked to Ensembl protein coding genes
+
+```{r anno_info, eval=TRUE}
+gtf = read.table(file=paste(bf,"reconstruction_v2/lncKO_merged_wEnsembl.annotated.gtf",sep=""),sep="\t",header=FALSE)
+
+transcripts = gtf %>% filter(V3=="transcript")
+
+extractVars = function(data,column,var) unlist(lapply(strsplit(data[,column],split=";",fixed=TRUE), function(a) gsub(paste(var," ",sep=""),"",a[grep(var,a)])))
+
+transcripts$transcript_id = extractVars(transcripts,"V9","transcript_id")
+transcripts$gene_id = extractVars(transcripts,"V9","gene_id")
+transcripts$class_code = extractVars(transcripts,"V9","class_code")
+transcripts$gene_name = NA
+transcripts$gene_name[grep("gene_name",transcripts$V9)] = extractVars(transcripts,"V9","gene_name")
+transcripts$ensembl = NA
+transcripts$ensembl[grep("cmp_ref",transcripts$V9)] = extractVars(transcripts,"V9","cmp_ref")
+
+anno = transcripts[,c("V1","V4","V5","V7","transcript_id","gene_id","class_code","gene_name","ensembl")]
+colnames(anno)[1:4] = c("chr","start","end","strand")
+
+ensembl_genes <- read.table(file=paste(bf,"data/ensembl_to_ncbi.2018-11-08.rno.ensembl94.txt",sep=""),sep="\t",header=FALSE)
+
+protein_coding <- anno[anno$class_code %in% c(" ="," j"),]
+protein_coding <- protein_coding[trim(protein_coding$ensembl) %in% ensembl_genes$V1[ensembl_genes$V3=="protein_coding"] | (!is.na(protein_coding$gene_name) & grepl("LRAP",protein_coding$gene_name)),]
+```
+
+
+### Differential expression - Isoform Level
+
+Generate count matrix and limit to isoforms that: 1) are associated with a protein-coding Ensembl gene and 2) have more than 50 summed across wildtype and knockout rats
+
+```{r isoform_cnt, eval=TRUE, include=FALSE}
+
+samples = c("WT1","WT2","WT3","Het1","Het2","Het3","KO1","KO2","KO3")
+
+for(i in samples){
+  x = read.table(file=paste(bf,"quantitation/RSEM.koRecon_v2/",i,".naive.isoforms.results",sep=""),sep="\t",header=TRUE)
+  x = x[,c("transcript_id","gene_id","expected_count")]
+  colnames(x)[3] = i
+  if(i!=samples[1]) cnts = merge(x,cnts,by=c("transcript_id","gene_id"))
+  if(i==samples[1]) cnts = x
+}
+
+
+for(i in samples){
+  x = read.table(file=paste(bf,"quantitation/RSEM.koRecon_v2/",i,".naive.isoforms.results",sep=""),sep="\t",header=TRUE)
+  x = x[,c("transcript_id","gene_id","TPM")]
+  colnames(x)[3] = i
+  if(i!=samples[1]) tpm = merge(x,tpm,by=c("transcript_id","gene_id"))
+  if(i==samples[1]) tpm = x
+}
+
+
+rownames(cnts) = cnts$transcript_id
+
+## limit to isoforms associated with protein coding genes
+filtered = cnts[rownames(cnts) %in% trim(protein_coding$transcript_id),c(3:11)]  
+
+## limit to isoforms with more than 50 reads across WT and KO animals
+filtered = filtered[rowSums(filtered[,c(1:3,7:9)])>50,]
+
+## create count matrix
+counts = round(filtered)
+```
+
+Number of isoforms from protein-coding genes are that are expressed above background: `r prettyNum(nrow(counts), big.mark=",")`
+
+```{r isoform_normCnt, eval=TRUE, include=FALSE}
+colData = data.frame(sample = colnames(filtered), genotype = as.factor(rep(c("KO","Het","WT"),each=3)))
+full_isoform = DESeqDataSetFromMatrix(countData = counts,colData = colData,design = ~ genotype)
+full_isoform = DESeq(full_isoform,test="LRT",reduced= ~ 1, fitType='local')
+norm_cnts_isoform = counts(full_isoform,normalized=TRUE)
+```
+
+
+**Figure 1. Relationships among samples using isoform read counts for isoforms from protein coding genes that are expressed above background.** Dendrogram was calculated using one minus the Spearman correlation coefficient as a measure of distance. Counts were adjusted for library size.
+
+```{r isoform_dendro, eval=TRUE}
+plot(hclust(as.dist(1-cor(norm_cnts_isoform,method="spearman"))),ylab="1 - Spearman Correlation Coefficient", main="", xlab="", sub="")
+```
+
+```{r isoform_de, eval=TRUE, include=FALSE}
+## Wald test for genotype effect
+dds_isoform = DESeqDataSetFromMatrix(countData = counts[,c(1:3,7:9)],colData = colData[c(1:3,7:9),],design = ~ genotype)
+dds_isoform = DESeq(dds_isoform,test="LRT",reduced= ~ 1, fitType='local')
+genoEffect_isoforms = results(dds_isoform)
+
+genoEffect_isoforms = genoEffect_isoforms[order(genoEffect_isoforms$pvalue),]
+```
+
+Number of isoforms that were analyzed by DESeq2: `r prettyNum(sum(!is.na(genoEffect_isoforms$pvalue)), big.mark=",")`
+
+### Differential expression - Gene Level
+
+Generate count matrix and limit to genes that: 1) are associated with a protein-coding Ensembl gene and 2) have more than 50 summed across wildtype and knockout rats
+
+```{r gene_cnt, eval=TRUE, include=FALSE}
+for(i in samples){
+  x = read.table(file=paste(bf,"quantitation/RSEM.koRecon_v2/",i,".naive.genes.results",sep=""),sep="\t",header=TRUE)
+  x = x[,c("gene_id","expected_count")]
+  colnames(x)[2] = i
+  if(i!=samples[1]) cnts = merge(x,cnts,by=c("gene_id"))
+  if(i==samples[1]) cnts = x
+}
+
+
+for(i in samples){
+  x = read.table(file=paste(bf,"quantitation/RSEM.koRecon_v2/",i,".naive.genes.results",sep=""),sep="\t",header=TRUE)
+  x = x[,c("gene_id","TPM")]
+  colnames(x)[2] = i
+  if(i!=samples[1]) gene_tpm = merge(x,gene_tpm,by=c("gene_id"))
+  if(i==samples[1]) gene_tpm = x
+}
+
+
+rownames(cnts) = cnts$gene_id
+
+filtered = cnts[rownames(cnts) %in% trim(protein_coding$gene_id),c(2:10)]  #remove control genes
+filtered = filtered[rowSums(filtered[,c(1:3,7:9)])>50,]
+
+counts = round(filtered)
+```
+
+Number of protein-coding genes are that are expressed above background: `r prettyNum(nrow(counts), big.mark=",")`
+
+```{r gene_normCnt, eval=TRUE, include=FALSE}
+colData = data.frame(sample = colnames(filtered), genotype = as.factor(rep(c("KO","Het","WT"),each=3)))
+full_gene = DESeqDataSetFromMatrix(countData = counts,colData = colData,design = ~ genotype)
+full_gene = DESeq(full_gene,test="LRT",reduced= ~ 1, fitType='local')
+norm_cnts_gene = counts(full_gene,normalized=TRUE)
+
+#save(norm_cnts_gene, norm_cnts_isoform, file=paste0(bf,"data/normalized_counts.Rdata"))
+```
+
+**Figure 2. Relationships among samples using gene read counts for protein coding genes that are expressed above background.** Dendrogram was calculated using one minus the Spearman correlation coefficient as a measure of distance. Counts were adjusted for library size.
+
+```{r gene_dendro, eval=TRUE}
+plot(hclust(as.dist(1-cor(norm_cnts_gene,method="spearman"))),ylab="1 - Spearman Correlation Coefficient", main="", xlab="", sub="")
+```
+
+
+```{r gene_de, eval=TRUE, include=FALSE}
+dds = DESeqDataSetFromMatrix(countData = counts[,c(1:3,7:9)],colData = colData[c(1:3,7:9),],design = ~ genotype)
+
+## Wald test for interaction and treatment effect
+dds = DESeq(dds,test="LRT",reduced= ~ 1)
+genoEffect = results(dds)
+
+genoEffect = genoEffect[order(genoEffect$pvalue),]
+```
+
+Number of genes that were analyzed by DESeq2: `r prettyNum(sum(!is.na(genoEffect$pvalue)), big.mark=",")`
+
+
+
+
+### Combine DE results with annotation
+
+
+```{r add_anno, eval=TRUE, include=FALSE}
+wAnno = merge(as.data.frame(genoEffect_isoforms),anno,by.x=0,by.y="transcript_id")
+wAnno = wAnno[order(wAnno$pvalue),]
+
+exp_summary = data.frame(norm_cnts_isoform) 
+exp_summary$transcript_id = rownames(exp_summary)
+exp_summary$KO_median = apply(exp_summary[,c("KO1","KO2","KO3")],1,median)
+exp_summary$Het_median = apply(exp_summary[,c("Het1","Het2","Het3")],1,median)
+exp_summary$WT_median = apply(exp_summary[,c("WT1","WT2","WT3")],1,median)
+exp_summary$KO_pctWT = exp_summary$KO_median/exp_summary$WT_median
+exp_summary$Het_pctWT = exp_summary$Het_median/exp_summary$WT_median
+exp_summary = exp_summary[,c("transcript_id","KO_median","Het_median","WT_median","KO_pctWT","Het_pctWT")]
+
+###  Gene Summary  ###
+gene_summary = wAnno %>% group_by(gene_id) %>% summarize(numTranscripts = length(gene_id))
+
+###  Results Table  ###
+wAnno = merge(wAnno,exp_summary,by.x="Row.names",by.y="transcript_id")
+wAnno = merge(wAnno,gene_summary,by="gene_id")
+
+gene_summary = data.frame(norm_cnts_gene) 
+gene_summary$gene_id = rownames(gene_summary)
+gene_summary$KO_median = apply(gene_summary[,c("KO1","KO2","KO3")],1,median)
+gene_summary$Het_median = apply(gene_summary[,c("Het1","Het2","Het3")],1,median)
+gene_summary$WT_median = apply(gene_summary[,c("WT1","WT2","WT3")],1,median)
+gene_summary$KO_pctWT = gene_summary$KO_median/gene_summary$WT_median
+gene_summary$Het_pctWT = gene_summary$Het_median/gene_summary$WT_median
+gene_summary = gene_summary[,c("gene_id","KO_median","Het_median","WT_median","KO_pctWT","Het_pctWT")]
+
+###  Gene Summary  ###
+gene_results = merge(as.data.frame(genoEffect),gene_summary,by.x=0,by.y="gene_id")
+colnames(gene_results) = c("gene_id",paste(colnames(gene_results)[-1],"_gene",sep=""))
+
+### Combined Results ###
+wAnno$gene_id <- trim(wAnno$gene_id)
+combined_results <- merge(wAnno,gene_results,by="gene_id")
+
+```
+
+
+
+```{r, eval=TRUE}
+## Sig Isoforms/Sig Genes
+
+sig_isoforms <- combined_results %>%
+  filter((!is.na(padj) & padj<0.10) | (!is.na(padj_gene) & padj_gene<0.10))
+
+## Numbers of Sig Isoforms/Genes
+
+#length(unique(sig_isoforms$gene_id))                         # number of sig genes - 751 (either gene or at least one isoform of the gene)
+#sum(!is.na(sig_isoforms$padj) & sig_isoforms$padj<0.10)      # number of sig isoforms - 782
+
+#save(combined_results, sig_isoforms, file=paste(bf,"Rdata/rnaSeqResults.",Sys.Date(),".Rdata",sep=""))
+```
+
+Number of significant genes (FDR<0.10  for either the gene or at least one isoform of the gene): `r length(unique(sig_isoforms$gene_id))`                         
+
+Number of significant isoforms (FDR<0.10): `r sum(!is.na(sig_isoforms$padj) & sig_isoforms$padj<0.10)`
+
+
+```{r summary_sig, eval=TRUE}
+#load(file=paste(bf,"Rdata/rnaSeqResults.","2019-01-23",".Rdata",sep=""))
+
+
+#Summary Table for Number of Significant Genes/Transcripts
+gene_results <- combined_results[!duplicated(combined_results$gene_id),]
+
+num_transcripts = sum(!is.na(combined_results$padj))
+
+combined_v2 = combined_results
+combined_v2$KO_pctWT[combined_v2$KO_median==0 & combined_v2$WT_median==0] = 1
+combined_v2$KO_pctWT[combined_v2$KO_median==0 | combined_v2$WT_median==0] = 99
+
+
+summary_results <- combined_v2 %>%
+  filter(!is.na(padj)) %>%
+  mutate(FDR0001 = as.numeric(padj<0.0001),
+         FDR001 = as.numeric(padj<0.001),
+         FDR01 = as.numeric(padj<0.01),
+         FDR05 = as.numeric(padj<0.05),
+         FDR10 = as.numeric(padj<0.10),
+         pct50 = as.numeric(KO_pctWT>1.5 | (1/KO_pctWT)>1.5),
+         pct100 = as.numeric(KO_pctWT>2 | (1/KO_pctWT)>2))
+
+table_results <- data.frame(threshold = c(0.10, 0.05, 0.01, 0.001, 0.0001),
+                            num_sig = colSums(summary_results[,c("FDR10","FDR05","FDR01","FDR001","FDR0001")]),
+                            num_sig_100 = colSums(summary_results[summary_results$pct100==1,c("FDR10","FDR05","FDR01","FDR001","FDR0001")]),
+                            num_sig_50 = colSums(summary_results[summary_results$pct50==1,c("FDR10","FDR05","FDR01","FDR001","FDR0001")]))
+
+colnames(table_results) = c("FDR Threshold","Number of Significant Isoforms","Number of Significant Isoforms with at least a 1-fold difference in expression","Number of Significant Isoforms with at least a 0.5-fold difference in expression")
+```
+
+**Table 5. Summary of number of significantly differentially expressed isoforms at various FDR thresholds.** 
+
+```{r table_5, results='asis',echo=FALSE,eval=TRUE}
+kable(as.data.frame(table_results), "html",align=rep("c",ncol(table_results)),row.names=FALSE) %>%
+  kable_styling(bootstrap_options = "striped", full_width = F, position="left")
+```
+
+```{r summ_gene, eval=TRUE}
+combined_v3 = combined_results[!duplicated(combined_results$gene_id),]
+combined_v3$KO_pctWT_gene[combined_v3$KO_median_gene==0 & combined_v3$WT_median_gene==0] = 1
+combined_v3$KO_pctWT_gene[combined_v3$KO_median_gene==0 | combined_v3$WT_median_gene==0] = 99
+
+
+summary_results_gene <- combined_v3 %>%
+  filter(!is.na(padj_gene)) %>%
+  mutate(FDR0001 = as.numeric(padj_gene<0.0001),
+         FDR001 = as.numeric(padj_gene<0.001),
+         FDR01 = as.numeric(padj_gene<0.01),
+         FDR05 = as.numeric(padj_gene<0.05),
+         FDR10 = as.numeric(padj_gene<0.10),
+         pct50 = as.numeric(KO_pctWT_gene>1.5 | (1/KO_pctWT_gene)>1.5),
+         pct100 = as.numeric(KO_pctWT_gene>2 | (1/KO_pctWT_gene)>2))
+
+table_results_gene <- data.frame(threshold = c(0.10, 0.05, 0.01, 0.001, 0.0001),
+                            num_sig = colSums(summary_results_gene[,c("FDR10","FDR05","FDR01","FDR001","FDR0001")]),
+                            num_sig_100 = colSums(summary_results_gene[summary_results_gene$pct100==1,c("FDR10","FDR05","FDR01","FDR001","FDR0001")]),
+                            num_sig_50 = colSums(summary_results_gene[summary_results_gene$pct50==1,c("FDR10","FDR05","FDR01","FDR001","FDR0001")]))
+colnames(table_results_gene) = c("FDR Threshold","Number of Significant Genes","Number of Significant Genes with at least a 1-fold difference in expression","Number of Significant Genes with at least a 0.5-fold difference in expression")
+```
+
+**Table 6. Summary of number of significantly differentially expressed genes at various FDR thresholds.** 
+
+```{r table_6, results='asis',echo=FALSE,eval=TRUE}
+kable(as.data.frame(table_results_gene), "html",align=rep("c",ncol(table_results_gene)),row.names=FALSE) %>%
+  kable_styling(bootstrap_options = "striped", full_width = F, position="left")
+```
+
+

@@ -1,0 +1,4 @@
+samtools sort /data/hi-seq/LRAP.KO/alignedReads/HISAT2/WT1.naive.bam /data/hi-seq/LRAP.KO/alignedReads/HISAT2/WT1.naive.sorted
+samtools sort /data/hi-seq/LRAP.KO/alignedReads/HISAT2/WT2.naive.bam /data/hi-seq/LRAP.KO/alignedReads/HISAT2/WT2.naive.sorted 
+samtools sort /data/hi-seq/LRAP.KO/alignedReads/HISAT2/WT3.naive.bam /data/hi-seq/LRAP.KO/alignedReads/HISAT2/WT3.naive.sorted
+samtools merge /data/hi-seq/LRAP.KO/alignedReads/HISAT2/WT.naive.bam /data/hi-seq/LRAP.KO/alignedReads/HISAT2/WT1.naive.sorted.bam /data/hi-seq/LRAP.KO/alignedReads/HISAT2/WT2.naive.sorted.bam /data/hi-seq/LRAP.KO/alignedReads/HISAT2/WT3.naive.sorted.bam &
